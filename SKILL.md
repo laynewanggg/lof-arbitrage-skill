@@ -1,0 +1,200 @@
+---
+name: lof-arbitrage
+description: "LOF 套利智能筛选服务 — 自动扫描全市场 LOF 基金溢价套利机会。该 skill 用于构建或集成 LOF（上市开放式基金）套利筛选系统，涵盖数据采集（东方财富、新浪财经、天天基金）、成本模型计算、风险评级（A/B/C/D）和格式化报告生成。适用于需要开发基金套利工具、量化筛选服务或金融数据聚合功能的场景。"
+---
+
+# LOF 套利智能筛选服务
+
+## 概述
+
+LOF 套利智能筛选服务是一个完整的基金套利机会扫描系统。核心理念是：不是简单列出溢价率，而是智能判断"值不值得做"。
+
+系统执行以下完整流程：
+1. 从东方财富获取全量 LOF 基金数据（300+ 只）
+2. 从新浪财经批量获取场内实时价格和成交额
+3. 从天天基金获取申购状态、限额、费率等详细信息
+4. 扣除全部成本后计算净收益率和实际收益金额
+5. 综合评级（A/B/C/D），给出"推荐/谨慎/不建议"的明确建议
+6. 生成格式化的文本报告
+
+## 适用场景
+
+- 构建 LOF 基金套利筛选工具
+- 为聊天机器人（企微/钉钉/飞书/Telegram）添加套利扫描功能
+- 开发定时任务自动推送套利机会
+- 学习金融数据采集和量化筛选的实现方式
+- 集成到任何 Node.js 后端服务
+
+## 核心架构
+
+### 文件结构
+
+```
+services/lof-arbitrage.js    # 核心服务（独立运行，无外部依赖）
+handlers/command-handler.js  # 指令调度（集成到聊天机器人时使用）
+config.js                    # 指令正则匹配配置
+```
+
+### 类设计
+
+```javascript
+const LofArbitrageService = require('./services/lof-arbitrage');
+const service = new LofArbitrageService(configOverrides);
+const result = await service.getArbitrageReport();
+// result = { text: string, opportunities: Array, summary: object }
+```
+
+`LofArbitrageService` 类为纯计算服务，不依赖数据库、消息队列或其他基础设施。只需 Node.js 18+（内置 fetch）即可运行。
+
+## 工作流
+
+### 流程一：独立运行（CLI / 定时任务）
+
+```bash
+node services/lof-arbitrage.js
+```
+
+直接实例化 `LofArbitrageService` 并调用 `getArbitrageReport()`。适用于：
+- 本地测试
+- cron 定时任务
+- 独立微服务
+
+### 流程二：集成到聊天机器人
+
+调用链路：
+
+```
+用户发送 "LOF套利" / "lof" / "基金套利" / "套利"
+  → config.js: COMMANDS.LOF_ARBITRAGE 正则匹配
+  → command-handler.js: handleLofArbitrage(userId)
+    → 发送 "⏳ 正在扫描..." 提示
+    → new LofArbitrageService().getArbitrageReport()
+    → 发送格式化报告
+```
+
+集成时参考 `references/integration-guide.md` 获取完整指令注册方式。
+
+### 流程三：自定义参数
+
+通过构造函数传入配置覆盖默认值：
+
+```javascript
+const service = new LofArbitrageService({
+  MIN_PREMIUM_RATE: 5,        // 提高溢价率门槛
+  ACCOUNT_COUNT: 3,           // 改为一拖三
+  PREMIUM_DECAY_DOMESTIC: 1.5 // 调整溢价衰减预估
+});
+```
+
+完整参数列表见 `references/config-params.md`。
+
+## 数据源与采集
+
+### 1. LOF 基金列表（东方财富）
+
+- 接口：`https://fund.eastmoney.com/data/FundGuideapi.aspx?dt=0&ft=lof&...`
+- 返回格式：`var rankData = {"datas":[...], "allPages":"N"}`
+- 每条数据为逗号分隔字符串，关键字段：代码(0)、名称(1)、申购状态(14)、净值(16)、折扣费率(19)、原始费率(22)
+- 需设置 Referer: `https://fund.eastmoney.com/`
+
+### 2. 场内实时价格（新浪财经）
+
+- 接口：`https://hq.sinajs.cn/list=sz161724,sz160416,...`
+- 支持批量查询（每批 50 只）
+- 代码前缀规则：5 开头为 `sh`，其他为 `sz`
+- 返回字段：名称(0)、最新价(3)、成交额(9)
+- 需设置 Referer: `https://finance.sina.com.cn/`
+
+### 3. 基金估值（天天基金 JSONP）
+
+- 接口：`https://fundgz.1234567.com.cn/js/{code}.js?rt={timestamp}`
+- 返回 JSONP：`jsonpgz({"dwjz":"1.023","gsz":"1.035",...})`
+- `dwjz` = 单位净值（上一交易日），`gsz` = 估算净值（盘中）
+
+### 4. 限额信息（天天基金费率页面）
+
+- 页面：`https://fundf10.eastmoney.com/jjfl_{code}.html`
+- 正则提取"日累计申购限额"字段值
+- 同时提取"申购状态"（开放/暂停）
+
+> ⚠️ 请求间隔设为 200ms 以避免限流。所有请求需携带 User-Agent 和 Referer header。
+
+## 成本模型
+
+```
+净收益率 = 溢价率 - 总成本
+总成本 = 申购费 + 卖出佣金 + 冲击成本 + 溢价衰减
+
+国内基金总成本 ≈ 0.15% + 0.025% + 0.1% + 1.0% = 1.275%
+QDII基金总成本 ≈ 0.15% + 0.025% + 0.1% + 2.0% = 2.275%
+```
+
+溢价率低于总成本的品种直接标记为 D 级过滤。
+
+## 评级体系
+
+| 评级 | 条件 | 展示 |
+|------|------|------|
+| 🟢 A 级 | 六账户≥500元 或 单账户≥200元，国内基金，成交额≥500万，风险不高 | 详细信息 + 建议操作 |
+| 🟡 B 级 | 六账户≥300元 或 单账户≥50元，但有不利因素 | 详细信息 + 风险提示 |
+| 🔴 C 级 | 有利润但收益太低，性价比差 | 摘要一行 |
+| ⛔ D 级 | 暂停申购/净收益为负/风险极高 | 不展示，仅统计数量 |
+
+## 风险评估维度
+
+1. **时间风险**：国内 T+2 (+15分)、QDII T+3 (+30分)
+2. **流动性**：日成交额 <100万 (+25分)、<500万 (+10分)
+3. **溢价幅度**：>20% (+20分)、>10% (+10分)
+4. **限购**：暂停申购 (+50分)、限额≤1000元 (+15分)
+5. **净收益**：为负 (+40分)
+
+风险得分 ≥60 为高风险，30~59 为中风险，<30 为低风险。
+
+## 报告格式
+
+生成的文本报告结构：
+
+```
+📊 LOF套利智能筛选报告
+━━━━━━━━━━━━━━━━━━━━━━━━
+⏰ {时间}
+📋 扫描 {总数} 只LOF，溢价候选 {候选数} 只
+
+🟢 推荐操作 ({N}只)
+────────────────────
+1. {基金名} ({代码})
+   溢价率: X% | 净值: X.XXX | 场内价: X.XXX
+   限额: {限额} | 申购费: X%
+   ⏱ 到账: T+{N} ({类型})
+   💰 单账户预期: ≈{N}元
+   💰 6账户预期: ≈{N}元
+   📊 日成交额: {N}万 | 流动性: {评价}
+   ⚠️ 风险: {等级}
+   📋 {建议}
+
+🟡 谨慎考虑 ({N}只)  ...
+🔴 不建议 ({N}只)     ...（仅摘要）
+⛔ 已过滤 {N} 只
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+💡 配置建议 ...
+⚠️ 风险提示 ...
+```
+
+## 扩展指南
+
+### 添加新的数据源
+
+在 `LofArbitrageService` 类中添加新的 `fetch*` 方法，然后在 `getArbitrageReport()` 的流程中插入调用。
+
+### 自定义报告格式
+
+重写 `formatReport()` 和 `_formatFundDetail()` 方法。可输出 Markdown、HTML 或 JSON。
+
+### 集成到其他消息平台
+
+仅需调用 `getArbitrageReport()` 获取 `result.text`，然后通过目标平台的 API 发送即可。`LofArbitrageService` 不绑定任何消息平台。
+
+### QDII 判断逻辑
+
+通过基金名称关键词匹配：QDII、原油、黄金、纳斯达克、标普、恒生、港股、全球、海外、中概 等。如需更精确的判断，可从基金详情接口获取基金类型字段。
